@@ -2,16 +2,20 @@ import asyncio
 
 from optparse import OptionParser
 
+
 async def io():
     await asyncio.sleep(0)
+
 
 async def heavy_coroutine(idx, loop, start):
     await io()
     print("%d heavy_coroutine time %f" % (idx, loop.time() - start))
 
+
 async def light_coroutine(idx, loop, start):
     await io()
     print("%d light_coroutine time %f" % (idx, loop.time() - start))
+
 
 async def main(loop):
     start = loop.time()
@@ -24,6 +28,7 @@ async def main(loop):
     ]
     await asyncio.gather(*tasks)
 
+
 async def qmain(loop):
     start = loop.time()
     tasks = [
@@ -35,7 +40,6 @@ async def qmain(loop):
         loop.spawn(light_coroutine(3, loop, start), partition='light')
     ]
     await asyncio.gather(*tasks)
-
 
 
 if __name__ == '__main__':

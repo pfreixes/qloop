@@ -17,25 +17,23 @@ method called `spawn`, perhaps:
 Future tasks and IO file descriptors created by spawned coroutines will be
 allocated at the same partition, sharing the same reactor queue.
 
-The different queues belonging to each partition are iterated in a round robin way,
-meanwhile each queue is handled as a regular FIFO queue. If, and only if, a queue
-runs out of callabcks the IO process is executed again, processing only those events
-related to the file descriptors that belong to that specific partion that owns that queue.
-The same for the scheduled calls.
+The different queues belonging to each partition are iterated in a round robin
+way,meanwhile each queue is handled as a regular FIFO queue. If, and only if,
+a queue runs out of callabcks the IO process is executed again, processing only
+those events related to the file descriptors that belong to that specific
+partion that owns that queue. The same for the scheduled calls.
 """
 import collections
 import heapq
 import logging
 
 from asyncio import Task
-from asyncio import Future
-from asyncio import Handle
 from asyncio import SelectorEventLoop
-from asyncio import DefaultEventLoopPolicy
+from asyncio import selectors
 from asyncio.log import logger
 from asyncio.base_events import _format_handle
 from asyncio.base_events import _MIN_SCHEDULED_TIMER_HANDLES
-from asyncio.base_events import _MIN_CANCELLED_TIMER_HANDLES_FRACTION 
+from asyncio.base_events import _MIN_CANCELLED_TIMER_HANDLES_FRACTION
 from asyncio import events
 from asyncio.events import BaseDefaultEventLoopPolicy
 
@@ -56,6 +54,7 @@ def _find_partition(loop):
         # out of a task scope
         return _ROOT_PARTITION
 
+
 class _Partition:
     def __init__(self):
         self.tasks = set()
@@ -72,13 +71,13 @@ class Loop(SelectorEventLoop):
         self._partitions = {
             _ROOT_PARTITION: _Partition()
         }
-        self._partitions_to_process = set((_ROOT_PARTITION,))
+        self._p_to_process = set((_ROOT_PARTITION,))
         self._task_factory = self._inherit_queue
         super().__init__(selector)
 
     def spawn(self, coro, partition=None):
-        """Place and run a coro to a specific and isolated partition, if partition is not given a new one
-        will be created.
+        """Place and run a coro to a specific and isolated partition,
+        if partition is not given a new one will be created.
 
         Return a task object bound to the coro.
         """
@@ -94,7 +93,7 @@ class Loop(SelectorEventLoop):
         except KeyError:
             self._partitions[partition] = _Partition()
             self._partitions[partition].tasks.add(task)
-            self._partitions_to_process.add(partition)
+            self._p_to_process.add(partition)
 
         return task
 
@@ -114,7 +113,10 @@ class Loop(SelectorEventLoop):
             del task._source_traceback[-1]
 
         self._partitions[task.partition].add_task(task)
-        task.add_done_callback(self._partitions[task.partition].remove_task, task)
+        task.add_done_callback(
+            self._partitions[task.partition].remove_task,
+            task
+        )
         return task
 
     def _call_soon(self, callback, args):
@@ -159,9 +161,9 @@ class Loop(SelectorEventLoop):
     def _process_events(self, event_list):
         for key, mask in event_list:
             fileobj, (reader, writer) = key.fileobj, key.data
-            for partition in self._partitions_to_process:
-                if fileobj in self._partitions[partion].readers or\
-                    fileobj in self._partitions[partion].writers:
+            for partition in self._p_to_process:
+                if fileobj in self._partitions[partition].readers or\
+                        fileobj in self._partitions[partition].writers:
                     if mask & selectors.EVENT_READ and reader is not None:
                         if reader._cancelled:
                             self._remove_reader(fileobj)
@@ -202,15 +204,16 @@ class Loop(SelectorEventLoop):
         Basically a copy of the original one, but running ready
         callbacks applying a round robin strategy between the differnet
         partitions. Once a queue, if it had at least one callback, runs out
-        of callbacks the IO loop is requested again for its IO and time handles.
+        of callbacks the IO loop is requested again for its IO and time
+        handles.
         """
         sched_count = sum(
-            [len(self._partitions[partition].scheduled) for partition in self._partitions_to_process])
+            [len(self._partitions[p].scheduled) for p in self._p_to_process])
 
         if (sched_count > _MIN_SCHEDULED_TIMER_HANDLES and
-             self._timer_cancelled_count / sched_count > _MIN_CANCELLED_TIMER_HANDLES_FRACTION):
+             self._timer_cancelled_count / sched_count > _MIN_CANCELLED_TIMER_HANDLES_FRACTION):  # noqa
 
-            for partition in self._partitions_to_process:
+            for partition in self._p_to_process:
                 # Remove delayed calls that were cancelled if their number
                 # is too high
                 new_scheduled = []
@@ -224,21 +227,30 @@ class Loop(SelectorEventLoop):
                 self._partitions[partition].scheduled = new_scheduled
                 self._timer_cancelled_count = 0
         else:
-            for partition in self._partitions_to_process:
+            for partition in self._p_to_process:
                 # Remove delayed calls that were cancelled from head of queue.
-                while self._partitions[partition].scheduled and self._partitions[partition].scheduled[0]._cancelled:
+                while self._partitions[partition].scheduled and\
+                        self._partitions[partition].scheduled[0]._cancelled:
                     self._timer_cancelled_count -= 1
-                    handle = heapq.heappop(self._partitions[partition].scheduled)
+                    handle = heapq.heappop(
+                        self._partitions[partition].scheduled
+                    )
                     handle._scheduled = False
 
         timeout = None
-        any_handles = any([bool(self._partitions[partition].handles) for partition in self._partitions])
-        any_scheduled = any([bool(self._partitions[partition].scheduled) for partition in self._partitions_to_process])
+        any_handles = any(
+            [bool(self._partitions[p].handles) for p in self._partitions]
+        )
+        any_scheduled = any(
+            [bool(self._partitions[p].scheduled) for p in self._p_to_process]
+        )
         if any_handles or self._stopping:
             timeout = 0
         elif any_scheduled:
             # Compute the desired timeout.
-            when = min([self._partitions[partition].scheduled[0]._when for partition in self._partitions_to_process])
+            when = min(
+                [self._partitions[p].scheduled[0]._when for p in self._p_to_process]  # noqa
+            )
             timeout = max(0, when - self.time())
 
         if self._debug and timeout != 0:
@@ -267,7 +279,7 @@ class Loop(SelectorEventLoop):
 
         # Handle 'later' callbacks that are ready.
         end_time = self.time() + self._clock_resolution
-        for partition in self._partitions_to_process:
+        for partition in self._p_to_process:
             while self._partitions[partition].scheduled:
                 handle = self._partitions[partition].scheduled[0]
                 if handle._when >= end_time:
@@ -276,18 +288,22 @@ class Loop(SelectorEventLoop):
                 handle._scheduled = False
                 self._partitions[partition].handles.append(handle)
 
-        partitions = [partition for partition in self._partitions if self._partitions[partition].handles]
-        ntodo = max([len(self._partitions[partition].handles) for partition in self._partitions])
+        partitions = [
+            p for p in self._partitions if self._partitions[p].handles
+        ]
+        ntodo = max(
+            [len(self._partitions[p].handles) for p in self._partitions]
+        )
         cnt = 0
-        partitions_to_process = set()
-        handles_executed_per_partition = {partition:0 for partition in self._partitions}
-        while not partitions_to_process and cnt < ntodo:
+        p_to_process = set()
+        handles_executed_per_partition = {p: 0 for p in self._partitions}
+        while not p_to_process and cnt < ntodo:
             for partition in partitions:
                 try:
                     handle = self._partitions[partition].handles.popleft()
                 except IndexError:
                     if handles_executed_per_partition[partition] > 0:
-                        partitions_to_process.add(partition)
+                        p_to_process.add(partition)
                     continue
                 else:
                     handles_executed_per_partition[partition] += 1
@@ -311,8 +327,8 @@ class Loop(SelectorEventLoop):
 
             cnt += 1
 
-        if partitions_to_process:
-            self._partitions_to_process = partitions_to_process
+        if p_to_process:
+            self._p_to_process = p_to_process
         else:
             # keep with the same ones, we didnt run the queues.
             # FIXME : it can create starvation
