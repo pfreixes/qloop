@@ -1,0 +1,6 @@
+qloop.egg-info
+*.pyc
+*.swp
+*.swo
+.cache/
+.eggs/
